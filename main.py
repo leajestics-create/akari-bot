@@ -39,4 +39,4 @@ def handle_message(message):
     reply = get_ai_response(message.text)
     bot.reply_to(message, reply)
 
-bot.infinity_polling()
+bot.()
