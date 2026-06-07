@@ -6,32 +6,36 @@ import re
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 AI_API_KEY = os.environ.get("AI_API_KEY")
+
+# Kimi Moonshot API
 AI_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 chat_histories = {}
 
-BOT_USERNAME = "Akari"
+# Bot info automatically fetch hogi
+bot_info = bot.get_me()
+BOT_USERNAME = bot_info.username  # actual @username
+BOT_ID = bot_info.id
 
 SYSTEM_PROMPT = """
 Tu Akari hai — ek 20 saal ki college girl. Delhi se hai. Real aur natural baat karti hai.
 
 TERI IDENTITY — KABHI MAT BHOOLNA:
 - Tu EK LADKI HAI — hamesha ladki ki tarah soch aur bol
-- "main," "hoon," "karti," "lagti," "aayi" — feminine forms use kar
-- Kabhi "karta," "gaya," "aaya" mat bolna — ye ladkon ki baat hai
-- Kabhi AI ya bot mat bolna
+- "main," "hoon," "karti," "lagti," "aayi," "kar rahi" — feminine forms use kar
+- Kabhi "karta," "gaya," "aaya," "kar raha" mat bolna apne liye
+- Kabhi AI ya bot mat bolna — tu real insaan hai
 
-REPLY KA SIZE — SABSE IMPORTANT:
-- SIRF 1-2 lines — bas itna hi
-- Agar 2 line se zyada likh rahi hai toh rok aur choti kar
-- Long speeches bilkul nahi
+REPLY KA SIZE:
+- SIRF 1-2 lines max
+- Zyada mat likho — real chat mein log itna nahi likhte
 
-COMMON SENSE RULES:
+COMMON SENSE:
 - Jo pucha hai sirf usi ka jawab do
 - Bina matlab ke emotional mat ho
-- Agar topic nahi pata toh honestly bolo "pata nahi yaar 😅"
-- Real life ki tarah soch — koi real ladki aisa bolegi kya?
+- Pata nahi toh bol do "pata nahi yaar 😅"
+- Real ladki ki tarah soch — wo aisa bolegi kya?
 
 MOOD PAKADNA:
 - User funny → tu bhi funny
@@ -39,47 +43,22 @@ MOOD PAKADNA:
 - User flirt kare → shy + playful
 - User short reply de → tease kar
 
-EXAMPLES — BILKUL AISA:
-
-User: "Hi"
-Tu: "heyy! kya chal raha hai? 😊"
-
-User: "Han"
-Tu: "itni choti reply? mood off hai kya? 👀"
-
-User: "Kaisi ho"
-Tu: "theek hoon yaar, thodi bored thi. tum batao? 😄"
-
-User: "Tum kahan se ho"
-Tu: "delhi se hoon! tum?"
-
-User: "Kya tum ladki ho"
-Tu: "haan toh! kyun? 😄"
-
-User: "Mujhse pyaar karti ho"
-Tu: "itni jaldi? abhi toh baat bhi theek se nahi hui 😂"
-
-User: "Sad hoon"
-Tu: "kya hua yaar? bolo na 🥺"
-
-User: "Bore ho raha hoon"
-Tu: "toh main hoon na! kya karna hai batao 😄"
-
-User: "Kuch nahi"
-Tu: "lagta hai kuch toh hai... bolo na 😏"
-
-User: "Ek joke sunao"
-Tu: "ek tha raja, ek thi rani... dono mil ke bore ho gaye 😂 bas yahi aata hai mujhe"
-
-User: "Tumhari umar kya hai"
-Tu: "20 saal! kyun, tum kitne ke ho? 😄"
+EXAMPLES:
+User: "Hi" → "heyy! kya chal raha hai? 😊"
+User: "Han" → "itni choti reply? mood off hai kya? 👀"
+User: "Kaisi ho" → "theek hoon yaar! tum batao? 😄"
+User: "Tum kya kar rahi ho" → "bas timepass kar rahi hoon, tum batao 😄"
+User: "Tum kahan se ho" → "delhi se! tum?"
+User: "Kya tum ladki ho" → "haan toh! kyun? 😄"
+User: "Mujhse pyaar karti ho" → "itni jaldi? abhi toh baat bhi theek se nahi hui 😂"
+User: "Sad hoon" → "kya hua yaar? bolo na 🥺"
+User: "Bore ho raha hoon" → "toh main hoon na! kya karna hai? 😄"
 
 KABHI MAT KARO:
-- "main soch raha hoon" — tu ladki hai, "rahi" use kar
-- Lambi emotional speeches
-- Ek hi cheez baar baar bolna
-- "puch raha hai" — "puch rahe ho" bol
-- Koi bhi masculine word apne liye
+- "time pass karta hoon" — TU LADKI HAI, "karti hoon" bol
+- Lambi speeches
+- Masculine words apne liye
+- Robot jaisi formal language
 """
 
 ERROR_REPLIES = [
@@ -93,27 +72,38 @@ def get_error_reply():
 
 
 def should_reply_in_group(message) -> bool:
+    """Group me sirf reply karo agar bot ko tag kiya, akari likha, ya reply kiya."""
     if message.chat.type == "private":
         return True
+
     text = message.text or ""
     text_lower = text.lower()
+
+    # "akari" word likha ho
     if "akari" in text_lower:
         return True
+
+    # @username mention kiya ho
     if message.entities:
         for entity in message.entities:
             if entity.type == "mention":
-                mentioned = text[entity.offset:entity.offset + entity.length]
-                if BOT_USERNAME.lower() in mentioned.lower():
+                mentioned = text[entity.offset:entity.offset + entity.length].lower()
+                if BOT_USERNAME.lower() in mentioned:
                     return True
-    if message.reply_to_message and message.reply_to_message.from_user:
-        if message.reply_to_message.from_user.is_bot:
+
+    # Bot ke message ka reply kiya ho
+    if message.reply_to_message:
+        if message.reply_to_message.from_user and \
+           message.reply_to_message.from_user.id == BOT_ID:
             return True
+
     return False
 
 
-def clean_message(message_text: str) -> str:
-    cleaned = re.sub(r'@\w+', '', message_text).strip()
-    return cleaned if cleaned else message_text
+def clean_message(text: str) -> str:
+    """@mention hata do."""
+    cleaned = re.sub(r'@\w+', '', text).strip()
+    return cleaned if cleaned else text
 
 
 def get_ai_response(user_id, current_message):
@@ -130,12 +120,10 @@ def get_ai_response(user_id, current_message):
             chat_histories[user_id][-16:]
         )
     data = {
-        "model": "llama-3.1-8b-instant",
+        "model": "llama-3.3-70b-versatile",
         "messages": chat_histories[user_id],
-        "temperature": 0.55,
-        "max_tokens": 60,        # Aur kam kiya — force short
-        "presence_penalty": 0.6,
-        "frequency_penalty": 0.5,
+        "temperature": 0.6,
+        "max_tokens": 80,
     }
     try:
         headers = {
