@@ -3,19 +3,18 @@ import requests
 import os
 import random
 import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 AI_API_KEY = os.environ.get("AI_API_KEY")
-
-# Kimi Moonshot API
 AI_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 chat_histories = {}
 
-# Bot info automatically fetch hogi
 bot_info = bot.get_me()
-BOT_USERNAME = bot_info.username  # actual @username
+BOT_USERNAME = bot_info.username
 BOT_ID = bot_info.id
 
 SYSTEM_PROMPT = """
@@ -35,7 +34,7 @@ COMMON SENSE:
 - Jo pucha hai sirf usi ka jawab do
 - Bina matlab ke emotional mat ho
 - Pata nahi toh bol do "pata nahi yaar 😅"
-- Real ladki ki tarah soch — wo aisa bolegi kya?
+- Real ladki ki tarah soch
 
 MOOD PAKADNA:
 - User funny → tu bhi funny
@@ -71,37 +70,43 @@ def get_error_reply():
     return random.choice(ERROR_REPLIES)
 
 
+# ── Render ke liye simple HTTP server ─────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Akari bot is running!")
+
+    def log_message(self, format, *args):
+        pass  # Logs quiet rakho
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
 def should_reply_in_group(message) -> bool:
-    """Group me sirf reply karo agar bot ko tag kiya, akari likha, ya reply kiya."""
     if message.chat.type == "private":
         return True
-
     text = message.text or ""
     text_lower = text.lower()
-
-    # "akari" word likha ho
     if "akari" in text_lower:
         return True
-
-    # @username mention kiya ho
     if message.entities:
         for entity in message.entities:
             if entity.type == "mention":
                 mentioned = text[entity.offset:entity.offset + entity.length].lower()
                 if BOT_USERNAME.lower() in mentioned:
                     return True
-
-    # Bot ke message ka reply kiya ho
     if message.reply_to_message:
         if message.reply_to_message.from_user and \
            message.reply_to_message.from_user.id == BOT_ID:
             return True
-
     return False
 
 
 def clean_message(text: str) -> str:
-    """@mention hata do."""
     cleaned = re.sub(r'@\w+', '', text).strip()
     return cleaned if cleaned else text
 
@@ -124,6 +129,8 @@ def get_ai_response(user_id, current_message):
         "messages": chat_histories[user_id],
         "temperature": 0.6,
         "max_tokens": 80,
+        "presence_penalty": 0.5,
+        "frequency_penalty": 0.4,
     }
     try:
         headers = {
@@ -160,5 +167,8 @@ def handle_message(message):
 
 
 if __name__ == "__main__":
+    # Health server alag thread mein chalaao
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
     print("Akari bot chal rahi hai...")
     bot.infinity_polling(timeout=30, long_polling_timeout=15)
