@@ -6,7 +6,7 @@ import re
 import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
+from datetime import datetime, timedelta
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 AI_API_KEY = os.environ.get("AI_API_KEY")
@@ -53,7 +53,18 @@ def init_db():
             kingdom TEXT PRIMARY KEY,
             member_count INTEGER DEFAULT 0,
             total_wins INTEGER DEFAULT 0,
-            total_losses INTEGER DEFAULT 0
+            total_losses INTEGER DEFAULT 0,
+            treasury INTEGER DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT,
+            amount INTEGER,
+            description TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
         )
     """)
     for k in ["crimson", "azure", "emerald", "shadow", "solar"]:
@@ -90,14 +101,17 @@ def get_or_create_user(user_id, username, display_name):
 def set_kingdom(user_id, kingdom):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
-        UPDATE users SET kingdom = ?, kingdom_locked = 1
-        WHERE user_id = ?
-    """, (kingdom, user_id))
-    c.execute("""
-        UPDATE kingdom_stats SET member_count = member_count + 1
-        WHERE kingdom = ?
-    """, (kingdom,))
+    c.execute("UPDATE users SET kingdom = ?, kingdom_locked = 1 WHERE user_id = ?", (kingdom, user_id))
+    c.execute("UPDATE kingdom_stats SET member_count = member_count + 1 WHERE kingdom = ?", (kingdom,))
+    conn.commit()
+    conn.close()
+
+def update_gold(user_id, amount, desc=""):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET gold = gold + ? WHERE user_id = ?", (amount, user_id))
+    c.execute("INSERT INTO transactions (user_id, type, amount, description) VALUES (?, ?, ?, ?)",
+              (user_id, "credit" if amount > 0 else "debit", abs(amount), desc))
     conn.commit()
     conn.close()
 
@@ -118,6 +132,15 @@ def get_kingdom_stats():
     conn.close()
     return [dict(r) for r in rows]
 
+def get_top_players(limit=10):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM users ORDER BY gold DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
 # ══════════════════════════════════════════════════════════
 #  KINGDOMS DATA
 # ══════════════════════════════════════════════════════════
@@ -130,25 +153,20 @@ KINGDOMS = {
     "solar":   {"name": "Solar",   "emoji": "🟡", "desc": "Economy empire. +10% Gold & better drops."},
 }
 
+DAILY_REWARDS = {
+    1: 500, 2: 600, 3: 700, 4: 800,
+    5: 900, 6: 1000, 7: 1500
+}
+
+ROB_SUCCESS_RATE = 0.35
+ROB_COOLDOWN_HOURS = 1
+BEGINNER_PROTECTION_LEVEL = 5
+
 def kingdom_badge(kingdom):
     if not kingdom:
         return "⚔️ Mercenary"
     k = KINGDOMS.get(kingdom)
     return f"{k['emoji']} {k['name']}" if k else "⚔️ Mercenary"
-
-# ══════════════════════════════════════════════════════════
-#  GAME COMMANDS
-# ══════════════════════════════════════════════════════════
-
-GAME_COMMANDS = ["/start", "/kingdom", "/profile", "/help", "/adminstats"]
-
-def is_game_command(text):
-    if not text:
-        return False
-    for cmd in GAME_COMMANDS:
-        if text.startswith(cmd):
-            return True
-    return False
 
 def get_display(tg_user):
     name = tg_user.first_name or ""
@@ -156,47 +174,44 @@ def get_display(tg_user):
         name += f" {tg_user.last_name}"
     return name.strip() or tg_user.username or str(tg_user.id)
 
-# ── /start ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+#  PHASE 1 — PROFILE COMMANDS
+# ══════════════════════════════════════════════════════════
+
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     user = message.from_user
     display = get_display(user)
     username = user.username or str(user.id)
     db_user = get_or_create_user(user.id, username, display)
-
     if db_user.get("kingdom"):
         k = kingdom_badge(db_user["kingdom"])
         bot.reply_to(message,
             f"⚔️ Welcome back, {display}!\n"
             f"🏰 Kingdom: {k}\n\n"
-            f"Use /profile to see your stats.\n"
-            f"Use /help for all commands."
+            f"/profile — Your stats\n"
+            f"/daily — Claim gold\n"
+            f"/help — All commands"
         )
     else:
         bot.reply_to(message,
             f"🏰 Welcome to Kingdom Wars!\n\n"
             f"Greetings, {display}!\n"
-            f"You have been granted 1,000 Gold.\n\n"
-            f"Choose your kingdom with /kingdom\n"
-            f"⚠️ Kingdom choice is permanent!"
+            f"💰 Starting Gold: 1,000\n\n"
+            f"Use /kingdom to choose your side!\n"
+            f"⚠️ Choice is permanent!"
         )
 
-# ── /kingdom ───────────────────────────────────────────────
 @bot.message_handler(commands=["kingdom"])
 def cmd_kingdom(message):
     user = message.from_user
     display = get_display(user)
     username = user.username or str(user.id)
     db_user = get_or_create_user(user.id, username, display)
-
     if db_user.get("kingdom_locked"):
         k = kingdom_badge(db_user["kingdom"])
-        bot.reply_to(message,
-            f"🔒 Already pledged to {k}\n"
-            f"Kingdom loyalty cannot be changed."
-        )
+        bot.reply_to(message, f"🔒 Already pledged to {k}\nCannot change kingdom.")
         return
-
     smallest = get_smallest_kingdom()
     text = "🏰 Choose Your Kingdom\n\n"
     for key, data in KINGDOMS.items():
@@ -204,60 +219,32 @@ def cmd_kingdom(message):
         if key == "solar":
             extra = " | +10% Gold"
         if key == smallest:
-            extra += " 🎯 +15% Daily"
+            extra += " 🎯+15% Daily"
         text += f"{data['emoji']} {data['name']}{extra}\n{data['desc']}\n\n"
-    text += "Reply with kingdom name:\ncrimson / azure / emerald / shadow / solar"
+    text += "Reply: crimson / azure / emerald / shadow / solar"
     bot.reply_to(message, text)
 
-# ── Kingdom selection reply ────────────────────────────────
-@bot.message_handler(func=lambda m: m.text and m.text.lower().strip() in KINGDOMS)
-def select_kingdom(message):
-    user = message.from_user
-    display = get_display(user)
-    username = user.username or str(user.id)
-    db_user = get_or_create_user(user.id, username, display)
-
-    if db_user.get("kingdom_locked"):
-        return
-
-    kingdom_key = message.text.lower().strip()
-    set_kingdom(user.id, kingdom_key)
-
-    k_data = KINGDOMS[kingdom_key]
-    smallest = get_smallest_kingdom()
-    bonus = ""
-    if kingdom_key == "solar":
-        bonus = "\n🌟 Bonus: +10% Gold | +10% Drop Rate"
-    if kingdom_key == smallest:
-        bonus += "\n🎯 Bonus: +15% Daily (Lowest Population)"
-
-    bot.reply_to(message,
-        f"⚔️ Kingdom Pledged!\n\n"
-        f"You joined {k_data['emoji']} {k_data['name']}!\n"
-        f"{k_data['desc']}{bonus}\n\n"
-        f"Your journey begins now!\n"
-        f"Use /profile to see your stats."
-    )
-
-# ── /profile ───────────────────────────────────────────────
 @bot.message_handler(commands=["profile"])
 def cmd_profile(message):
     user = message.from_user
     display = get_display(user)
     username = user.username or str(user.id)
     db_user = get_or_create_user(user.id, username, display)
-
     if not db_user.get("kingdom"):
-        bot.reply_to(message,
-            "⚠️ No kingdom yet!\nUse /kingdom to pledge loyalty."
-        )
+        bot.reply_to(message, "⚠️ No kingdom yet!\nUse /kingdom first.")
         return
-
     k = kingdom_badge(db_user["kingdom"])
     battles = db_user["battles"]
     win_rate = round((db_user["wins"] / battles) * 100) if battles > 0 else 0
-
-    text = (
+    prot = ""
+    if db_user.get("protection_until"):
+        try:
+            pt = datetime.fromisoformat(db_user["protection_until"])
+            if pt > datetime.now():
+                prot = f"\n🛡️ Protected until: {pt.strftime('%d %b %H:%M')}"
+        except:
+            pass
+    bot.reply_to(message,
         f"👤 {db_user['display_name']}\n"
         f"🏰 {k}\n"
         f"━━━━━━━━━━━━━━\n"
@@ -271,30 +258,350 @@ def cmd_profile(message):
         f"🔥 Streak: {db_user['current_streak']}\n"
         f"🏆 Best: {db_user['best_streak']}\n"
         f"━━━━━━━━━━━━━━\n"
-        f"📅 Daily Streak: {db_user['daily_streak']} days"
+        f"📅 Daily Streak: {db_user['daily_streak']} days{prot}"
     )
-    bot.reply_to(message, text)
 
-# ── /help ──────────────────────────────────────────────────
 @bot.message_handler(commands=["help"])
 def cmd_help(message):
-    text = (
+    bot.reply_to(message,
         "⚔️ Kingdom Wars Commands\n\n"
         "🏰 Setup\n"
         "/start — Register\n"
         "/kingdom — Choose kingdom\n"
         "/profile — Your stats\n\n"
-        "💰 Economy (Coming Soon)\n"
-        "/daily — Daily gold\n"
-        "/rob — Rob a player\n"
-        "/protect — Buy protection\n\n"
+        "💰 Economy\n"
+        "/daily — Daily gold reward\n"
+        "/rob @user — Rob a player\n"
+        "/protect — Buy protection\n"
+        "/leaderboard — Top players\n\n"
         "⚔️ Battle (Coming Soon)\n"
         "/battle — Start war\n"
         "/join — Join battle\n"
-        "/draft — Pick cards\n\n"
-        "🏆 Rankings (Coming Soon)\n"
-        "/leaderboard — Top players"
+        "/draft — Pick cards"
     )
+
+# ══════════════════════════════════════════════════════════
+#  PHASE 2 — ECONOMY
+# ══════════════════════════════════════════════════════════
+
+# ── /daily ─────────────────────────────────────────────────
+@bot.message_handler(commands=["daily"])
+def cmd_daily(message):
+    user = message.from_user
+    display = get_display(user)
+    username = user.username or str(user.id)
+    db_user = get_or_create_user(user.id, username, display)
+
+    if not db_user.get("kingdom"):
+        bot.reply_to(message, "⚠️ Choose kingdom first!\nUse /kingdom")
+        return
+
+    now = datetime.now()
+    last_daily = db_user.get("last_daily")
+    daily_streak = db_user.get("daily_streak", 0)
+
+    # Check cooldown
+    if last_daily:
+        try:
+            last_dt = datetime.fromisoformat(last_daily)
+            diff = now - last_dt
+            if diff.total_seconds() < 86400:  # 24 hours
+                remaining = timedelta(seconds=86400) - diff
+                hours = int(remaining.total_seconds() // 3600)
+                mins = int((remaining.total_seconds() % 3600) // 60)
+                bot.reply_to(message,
+                    f"⏰ Already claimed today!\n"
+                    f"Next reward in: {hours}h {mins}m"
+                )
+                return
+            # Streak check — if more than 48 hours, reset streak
+            if diff.total_seconds() > 172800:
+                daily_streak = 0
+        except:
+            daily_streak = 0
+
+    # Calculate streak
+    daily_streak = (daily_streak % 7) + 1
+
+    # Base reward
+    day_key = daily_streak if daily_streak <= 7 else 7
+    base_reward = DAILY_REWARDS.get(day_key, 500)
+
+    # Kingdom bonuses
+    bonus_pct = 0
+    kingdom = db_user.get("kingdom", "")
+    if kingdom == "solar":
+        bonus_pct += 10
+    smallest = get_smallest_kingdom()
+    if kingdom == smallest:
+        bonus_pct += 15
+
+    bonus_amount = int(base_reward * bonus_pct / 100)
+    total_reward = base_reward + bonus_amount
+
+    # Update DB
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        UPDATE users SET
+            gold = gold + ?,
+            daily_streak = ?,
+            last_daily = ?
+        WHERE user_id = ?
+    """, (total_reward, daily_streak, now.isoformat(), user.id))
+    c.execute("INSERT INTO transactions (user_id, type, amount, description) VALUES (?, ?, ?, ?)",
+              (user.id, "credit", total_reward, f"Daily reward day {daily_streak}"))
+    conn.commit()
+    conn.close()
+
+    db_user = get_user(user.id)
+    bonus_text = f"\n🎁 Kingdom Bonus: +{bonus_amount} ({bonus_pct}%)" if bonus_pct > 0 else ""
+    streak_text = "\n🎴 +1 Rare Collection Card!" if daily_streak == 7 else ""
+
+    bot.reply_to(message,
+        f"🎁 Daily Reward!\n\n"
+        f"Day {daily_streak}/7 Streak\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"💰 Reward: +{base_reward} Gold{bonus_text}{streak_text}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"💰 Total Gold: {db_user['gold']:,}\n\n"
+        f"{'🔥 ' * min(daily_streak, 7)}Come back tomorrow!"
+    )
+
+# ── /protect ───────────────────────────────────────────────
+@bot.message_handler(commands=["protect"])
+def cmd_protect(message):
+    user = message.from_user
+    display = get_display(user)
+    username = user.username or str(user.id)
+    db_user = get_or_create_user(user.id, username, display)
+
+    if not db_user.get("kingdom"):
+        bot.reply_to(message, "⚠️ Choose kingdom first!\nUse /kingdom")
+        return
+
+    PROTECTION_OPTIONS = {
+        "1h":  {"hours": 1,    "cost": 100,  "label": "1 Hour"},
+        "24h": {"hours": 24,   "cost": 500,  "label": "24 Hours"},
+        "7d":  {"hours": 168,  "cost": 2000, "label": "7 Days"},
+    }
+
+    args = message.text.split()
+    if len(args) < 2 or args[1] not in PROTECTION_OPTIONS:
+        current_prot = ""
+        if db_user.get("protection_until"):
+            try:
+                pt = datetime.fromisoformat(db_user["protection_until"])
+                if pt > datetime.now():
+                    current_prot = f"\n🛡️ Active until: {pt.strftime('%d %b %H:%M')}\n"
+            except:
+                pass
+        bot.reply_to(message,
+            f"🛡️ Protection Options{current_prot}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"/protect 1h  — 1 Hour | 100 Gold\n"
+            f"/protect 24h — 24 Hours | 500 Gold\n"
+            f"/protect 7d  — 7 Days | 2,000 Gold\n\n"
+            f"💰 Your Gold: {db_user['gold']:,}"
+        )
+        return
+
+    opt = PROTECTION_OPTIONS[args[1]]
+    cost = opt["cost"]
+
+    if db_user["gold"] < cost:
+        bot.reply_to(message,
+            f"❌ Not enough gold!\n"
+            f"Need: {cost:,} | Have: {db_user['gold']:,}"
+        )
+        return
+
+    # Apply protection
+    until = datetime.now() + timedelta(hours=opt["hours"])
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET gold = gold - ?, protection_until = ? WHERE user_id = ?",
+              (cost, until.isoformat(), user.id))
+    c.execute("INSERT INTO transactions (user_id, type, amount, description) VALUES (?, ?, ?, ?)",
+              (user.id, "debit", cost, f"Protection {opt['label']}"))
+    conn.commit()
+    conn.close()
+
+    db_user = get_user(user.id)
+    bot.reply_to(message,
+        f"🛡️ Protection Active!\n\n"
+        f"Duration: {opt['label']}\n"
+        f"Until: {until.strftime('%d %b %H:%M')}\n"
+        f"Cost: -{cost:,} Gold\n"
+        f"💰 Remaining: {db_user['gold']:,}"
+    )
+
+# ── /rob ───────────────────────────────────────────────────
+@bot.message_handler(commands=["rob"])
+def cmd_rob(message):
+    user = message.from_user
+    display = get_display(user)
+    username = user.username or str(user.id)
+    robber = get_or_create_user(user.id, username, display)
+
+    if not robber.get("kingdom"):
+        bot.reply_to(message, "⚠️ Choose kingdom first!\nUse /kingdom")
+        return
+
+    # Beginner protection check
+    if robber["level"] <= BEGINNER_PROTECTION_LEVEL:
+        bot.reply_to(message,
+            f"🔰 You are a beginner (Level {robber['level']})!\n"
+            f"Rob unlocks at Level {BEGINNER_PROTECTION_LEVEL + 1}."
+        )
+        return
+
+    # Check if robber is protected
+    if robber.get("protection_until"):
+        try:
+            pt = datetime.fromisoformat(robber["protection_until"])
+            if pt > datetime.now():
+                bot.reply_to(message,
+                    "🛡️ Protected players cannot rob others!\n"
+                    "Your protection must expire first."
+                )
+                return
+        except:
+            pass
+
+    # Get target
+    target_user = None
+    if message.reply_to_message:
+        target_tg = message.reply_to_message.from_user
+        target_user = get_user(target_tg.id)
+    elif message.entities:
+        for entity in message.entities:
+            if entity.type == "mention":
+                mentioned = message.text[entity.offset:entity.offset + entity.length]
+                uname = mentioned.lstrip("@")
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute("SELECT * FROM users WHERE username = ?", (uname,))
+                row = c.fetchone()
+                conn.close()
+                if row:
+                    target_user = dict(row)
+
+    if not target_user:
+        bot.reply_to(message,
+            "❌ No target found!\n\n"
+            "Usage:\n"
+            "/rob @username\n"
+            "Or reply to someone's message with /rob"
+        )
+        return
+
+    if target_user["user_id"] == user.id:
+        bot.reply_to(message, "😂 Rob yourself? Really?")
+        return
+
+    # Target protection check
+    if target_user.get("protection_until"):
+        try:
+            pt = datetime.fromisoformat(target_user["protection_until"])
+            if pt > datetime.now():
+                bot.reply_to(message,
+                    f"🛡️ {target_user['display_name']} is protected!\n"
+                    f"Protection until: {pt.strftime('%d %b %H:%M')}"
+                )
+                return
+        except:
+            pass
+
+    # Beginner protection
+    if target_user["level"] <= BEGINNER_PROTECTION_LEVEL:
+        bot.reply_to(message,
+            f"🔰 {target_user['display_name']} is a beginner!\n"
+            f"Cannot rob players under Level {BEGINNER_PROTECTION_LEVEL + 1}."
+        )
+        return
+
+    if target_user["gold"] < 100:
+        bot.reply_to(message,
+            f"💸 {target_user['display_name']} is too poor!\n"
+            f"They only have {target_user['gold']} Gold."
+        )
+        return
+
+    # Rob attempt
+    success = random.random() < ROB_SUCCESS_RATE
+    if success:
+        # Steal 10-30% of target's gold
+        steal_pct = random.uniform(0.10, 0.30)
+        stolen = int(target_user["gold"] * steal_pct)
+        stolen = max(50, min(stolen, 5000))
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE users SET gold = gold - ? WHERE user_id = ?", (stolen, target_user["user_id"]))
+        c.execute("UPDATE users SET gold = gold + ? WHERE user_id = ?", (stolen, user.id))
+        c.execute("INSERT INTO transactions (user_id, type, amount, description) VALUES (?, ?, ?, ?)",
+                  (user.id, "credit", stolen, f"Rob from {target_user['display_name']}"))
+        c.execute("INSERT INTO transactions (user_id, type, amount, description) VALUES (?, ?, ?, ?)",
+                  (target_user["user_id"], "debit", stolen, f"Robbed by {display}"))
+        conn.commit()
+        conn.close()
+
+        robber = get_user(user.id)
+        bot.reply_to(message,
+            f"✅ Rob Successful!\n\n"
+            f"🦹 You robbed {target_user['display_name']}\n"
+            f"💰 Stolen: {stolen:,} Gold\n"
+            f"💰 Your Gold: {robber['gold']:,}"
+        )
+        # Notify target if possible
+        try:
+            bot.send_message(target_user["user_id"],
+                f"🚨 You were robbed!\n"
+                f"🦹 {display} stole {stolen:,} Gold!\n"
+                f"Use /protect to stay safe."
+            )
+        except:
+            pass
+    else:
+        # Failed rob — pay fine
+        fine = min(200, robber["gold"] // 10)
+        if fine > 0:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("UPDATE users SET gold = gold - ? WHERE user_id = ?", (fine, user.id))
+            conn.commit()
+            conn.close()
+        robber = get_user(user.id)
+        bot.reply_to(message,
+            f"❌ Rob Failed!\n\n"
+            f"🦹 You got caught!\n"
+            f"💸 Fine: -{fine:,} Gold\n"
+            f"💰 Your Gold: {robber['gold']:,}"
+        )
+
+# ── /leaderboard ───────────────────────────────────────────
+@bot.message_handler(commands=["leaderboard"])
+def cmd_leaderboard(message):
+    players = get_top_players(10)
+    kingdom_data = get_kingdom_stats()
+
+    text = "🏆 Leaderboard\n\n"
+    text += "💰 Top Players\n"
+    medals = ["🥇", "🥈", "🥉"]
+    for i, p in enumerate(players):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        k = KINGDOMS.get(p.get("kingdom", ""), {})
+        emoji = k.get("emoji", "⚔️")
+        text += f"{medal} {emoji} {p['display_name']}: {p['gold']:,} Gold\n"
+
+    text += "\n🏰 Kingdom Rankings\n"
+    for i, k in enumerate(kingdom_data):
+        kdata = KINGDOMS.get(k["kingdom"], {})
+        emoji = kdata.get("emoji", "⚔️")
+        text += f"{i+1}. {emoji} {k['kingdom'].capitalize()}: {k['member_count']} members\n"
+
     bot.reply_to(message, text)
 
 # ── /adminstats ────────────────────────────────────────────
@@ -306,28 +613,49 @@ def cmd_adminstats(message):
     total = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM users WHERE kingdom IS NULL")
     no_kingdom = c.fetchone()[0]
-    c.execute("SELECT SUM(gold), AVG(gold) FROM users")
+    c.execute("SELECT SUM(gold), AVG(gold), MAX(gold) FROM users")
     gold_row = c.fetchone()
     conn.close()
-
     kingdom_data = get_kingdom_stats()
     k_lines = ""
     for k in kingdom_data:
         kname = KINGDOMS.get(k["kingdom"], {})
         emoji = kname.get("emoji", "⚔️")
         k_lines += f"{emoji} {k['kingdom'].capitalize()}: {k['member_count']} players\n"
-
-    text = (
+    bot.reply_to(message,
         f"🛡️ Admin Dashboard\n"
         f"━━━━━━━━━━━━━━\n"
-        f"👥 Total Users: {total}\n"
-        f"❓ No Kingdom: {no_kingdom}\n\n"
+        f"👥 Total: {total} | No Kingdom: {no_kingdom}\n\n"
         f"🏰 Kingdoms\n{k_lines}\n"
         f"💰 Economy\n"
-        f"Total Gold: {int(gold_row[0] or 0):,}\n"
-        f"Avg Gold: {int(gold_row[1] or 0):,}"
+        f"Total: {int(gold_row[0] or 0):,} Gold\n"
+        f"Avg: {int(gold_row[1] or 0):,} | Max: {int(gold_row[2] or 0):,}"
     )
-    bot.reply_to(message, text)
+
+# ── Kingdom selection ──────────────────────────────────────
+@bot.message_handler(func=lambda m: m.text and m.text.lower().strip() in KINGDOMS)
+def select_kingdom(message):
+    user = message.from_user
+    display = get_display(user)
+    username = user.username or str(user.id)
+    db_user = get_or_create_user(user.id, username, display)
+    if db_user.get("kingdom_locked"):
+        return
+    kingdom_key = message.text.lower().strip()
+    set_kingdom(user.id, kingdom_key)
+    k_data = KINGDOMS[kingdom_key]
+    smallest = get_smallest_kingdom()
+    bonus = ""
+    if kingdom_key == "solar":
+        bonus = "\n🌟 +10% Gold | +10% Drop Rate"
+    if kingdom_key == smallest:
+        bonus += "\n🎯 +15% Daily (Lowest Population)"
+    bot.reply_to(message,
+        f"⚔️ Kingdom Pledged!\n\n"
+        f"You joined {k_data['emoji']} {k_data['name']}!\n"
+        f"{k_data['desc']}{bonus}\n\n"
+        f"Use /profile to see your stats!"
+    )
 
 # ══════════════════════════════════════════════════════════
 #  AKARI AI CHATBOT
@@ -344,7 +672,6 @@ TERI IDENTITY — KABHI MAT BHOOLNA:
 
 REPLY KA SIZE:
 - SIRF 1-2 lines max
-- Zyada mat likho — real chat mein log itna nahi likhte
 
 MOOD PAKADNA:
 - User funny → tu bhi funny
@@ -356,7 +683,6 @@ EXAMPLES:
 User: "Hi" → "heyy! kya chal raha hai? 😊"
 User: "Han" → "itni choti reply? mood off hai kya? 👀"
 User: "Kaisi ho" → "theek hoon yaar! tum batao? 😄"
-User: "Tum kya kar rahi ho" → "bas timepass kar rahi hoon, tum batao 😄"
 User: "Kya tum ladki ho" → "haan toh! kyun? 😄"
 User: "Sad hoon" → "kya hua yaar? bolo na 🥺"
 
@@ -375,12 +701,11 @@ ERROR_REPLIES = [
 def get_error_reply():
     return random.choice(ERROR_REPLIES)
 
-def should_reply_in_group(message) -> bool:
+def should_reply_in_group(message):
     if message.chat.type == "private":
         return True
     text = message.text or ""
-    text_lower = text.lower()
-    if "akari" in text_lower:
+    if "akari" in text.lower():
         return True
     if message.entities:
         for entity in message.entities:
@@ -394,23 +719,16 @@ def should_reply_in_group(message) -> bool:
             return True
     return False
 
-def clean_message(text: str) -> str:
+def clean_message(text):
     cleaned = re.sub(r'@\w+', '', text).strip()
     return cleaned if cleaned else text
 
 def get_ai_response(user_id, current_message):
     if user_id not in chat_histories:
-        chat_histories[user_id] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-    chat_histories[user_id].append({
-        "role": "user", "content": current_message
-    })
+        chat_histories[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    chat_histories[user_id].append({"role": "user", "content": current_message})
     if len(chat_histories[user_id]) > 17:
-        chat_histories[user_id] = (
-            [chat_histories[user_id][0]] +
-            chat_histories[user_id][-16:]
-        )
+        chat_histories[user_id] = [chat_histories[user_id][0]] + chat_histories[user_id][-16:]
     data = {
         "model": "llama-3.3-70b-versatile",
         "messages": chat_histories[user_id],
@@ -420,24 +738,16 @@ def get_ai_response(user_id, current_message):
         "frequency_penalty": 0.4,
     }
     try:
-        headers = {
-            "Authorization": f"Bearer {AI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        response = requests.post(
-            AI_API_URL, headers=headers, json=data, timeout=15
-        )
+        headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
+        response = requests.post(AI_API_URL, headers=headers, json=data, timeout=15)
         response.raise_for_status()
         ai_reply = response.json()['choices'][0]['message']['content'].strip()
-        chat_histories[user_id].append({
-            "role": "assistant", "content": ai_reply
-        })
+        chat_histories[user_id].append({"role": "assistant", "content": ai_reply})
         return ai_reply
     except Exception as e:
         print(f"AI Error: {e}")
         return get_error_reply()
 
-# ── Main message handler — AI chatbot ─────────────────────
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     if not message.text:
@@ -445,10 +755,6 @@ def handle_message(message):
     user_text = message.text.strip()
     if not user_text:
         return
-    # Game commands alag handle ho chuke hain upar
-    if is_game_command(user_text):
-        return
-    # Group check
     if not should_reply_in_group(message):
         return
     clean_text = clean_message(user_text)
@@ -464,7 +770,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Kingdom Wars + Akari Bot Running!")
+        self.wfile.write(b"Kingdom Wars + Akari Running!")
     def log_message(self, format, *args):
         pass
 
@@ -481,5 +787,5 @@ if __name__ == "__main__":
     init_db()
     t = threading.Thread(target=run_health_server, daemon=True)
     t.start()
-    print("Kingdom Wars + Akari bot chal rahi hai...")
+    print("Kingdom Wars Phase 1+2 + Akari bot running...")
     bot.infinity_polling(timeout=30, long_polling_timeout=15)
