@@ -78,7 +78,16 @@ def init_db():
             created_by INTEGER,
             created_at TEXT DEFAULT (datetime('now')),
             started_at TEXT DEFAULT NULL,
-            winner_kingdom TEXT DEFAULT NULL
+            winner_kingdom TEXT DEFAULT NULL,
+            current_round INTEGER DEFAULT 0,
+            team1_wins INTEGER DEFAULT 0,
+            team2_wins INTEGER DEFAULT 0,
+            team1_total_power REAL DEFAULT 0,
+            team2_total_power REAL DEFAULT 0,
+            team1_bonus REAL DEFAULT 0,
+            team2_bonus REAL DEFAULT 0,
+            team1_last_result TEXT DEFAULT NULL,
+            team2_last_result TEXT DEFAULT NULL
         )
     """)
     c.execute("""
@@ -91,6 +100,45 @@ def init_db():
             UNIQUE(battle_id, user_id)
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS battle_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            battle_id INTEGER,
+            user_id INTEGER,
+            dealt_cards TEXT,
+            drafted_cards TEXT DEFAULT NULL,
+            confirmed INTEGER DEFAULT 0,
+            UNIQUE(battle_id, user_id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS battle_round_plays (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            battle_id INTEGER,
+            round_number INTEGER,
+            user_id INTEGER,
+            card_power INTEGER,
+            UNIQUE(battle_id, round_number, user_id)
+        )
+    """)
+    existing_cols = [row[1] for row in c.execute("PRAGMA table_info(battles)").fetchall()]
+    new_cols = {
+        "current_round": "INTEGER DEFAULT 0",
+        "team1_wins": "INTEGER DEFAULT 0",
+        "team2_wins": "INTEGER DEFAULT 0",
+        "team1_total_power": "REAL DEFAULT 0",
+        "team2_total_power": "REAL DEFAULT 0",
+        "team1_bonus": "REAL DEFAULT 0",
+        "team2_bonus": "REAL DEFAULT 0",
+        "team1_last_result": "TEXT DEFAULT NULL",
+        "team2_last_result": "TEXT DEFAULT NULL",
+    }
+    for col, col_type in new_cols.items():
+        if col not in existing_cols:
+            try:
+                c.execute(f"ALTER TABLE battles ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass
     for k in ["crimson", "azure", "emerald", "shadow", "solar"]:
         c.execute("INSERT OR IGNORE INTO kingdom_stats (kingdom) VALUES (?)", (k,))
     conn.commit()
@@ -246,6 +294,132 @@ def update_battle_status(battle_id, status):
     conn.commit()
     conn.close()
 
+# ── Phase 4: Draft DB functions ────────────────────────────
+
+def deal_cards(battle_id, user_id):
+    """Deal 6 unique random power cards (1-10) to a player."""
+    cards = random.sample(range(1, 11), 6)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR REPLACE INTO battle_drafts (battle_id, user_id, dealt_cards, drafted_cards, confirmed)
+        VALUES (?, ?, ?, NULL, 0)
+    """, (battle_id, user_id, ",".join(map(str, cards))))
+    conn.commit()
+    conn.close()
+    return cards
+
+def get_draft(battle_id, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM battle_drafts WHERE battle_id = ? AND user_id = ?", (battle_id, user_id))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    d["dealt_cards"] = [int(x) for x in d["dealt_cards"].split(",")] if d["dealt_cards"] else []
+    d["drafted_cards"] = [int(x) for x in d["drafted_cards"].split(",")] if d["drafted_cards"] else []
+    return d
+
+def set_drafted_cards(battle_id, user_id, cards):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE battle_drafts SET drafted_cards = ?, confirmed = 0 WHERE battle_id = ? AND user_id = ?",
+              (",".join(map(str, cards)), battle_id, user_id))
+    conn.commit()
+    conn.close()
+
+def confirm_draft(battle_id, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE battle_drafts SET confirmed = 1 WHERE battle_id = ? AND user_id = ?",
+              (battle_id, user_id))
+    conn.commit()
+    conn.close()
+
+def get_active_battle_for_user(user_id):
+    """Find a battle the user is part of that is in drafting or battle status."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT b.* FROM battles b
+        JOIN battle_players bp ON b.battle_id = bp.battle_id
+        WHERE bp.user_id = ? AND b.status IN ('drafting', 'battle')
+        ORDER BY b.battle_id DESC LIMIT 1
+    """, (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def all_players_confirmed(battle_id):
+    players = get_battle_players(battle_id)
+    for p in players:
+        d = get_draft(battle_id, p["user_id"])
+        if not d or not d["confirmed"] or len(d["drafted_cards"]) != 4:
+            return False
+    return True
+
+# ── Phase 4: Round play DB functions ───────────────────────
+
+def play_card(battle_id, round_number, user_id, card_power):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO battle_round_plays (battle_id, round_number, user_id, card_power)
+            VALUES (?, ?, ?, ?)
+        """, (battle_id, round_number, user_id, card_power))
+        conn.commit()
+        success = True
+    except sqlite3.IntegrityError:
+        success = False
+    conn.close()
+    return success
+
+def get_round_play(battle_id, round_number, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT card_power FROM battle_round_plays
+        WHERE battle_id = ? AND round_number = ? AND user_id = ?
+    """, (battle_id, round_number, user_id))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def all_players_played_round(battle_id, round_number):
+    players = get_battle_players(battle_id)
+    for p in players:
+        if get_round_play(battle_id, round_number, p["user_id"]) is None:
+            return False
+    return True
+
+def get_played_powers(battle_id, user_id):
+    """Get list of card powers this player has already played (any round)."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT card_power FROM battle_round_plays
+        WHERE battle_id = ? AND user_id = ?
+    """, (battle_id, user_id))
+    rows = c.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def update_battle_round_state(battle_id, **kwargs):
+    if not kwargs:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cols = ", ".join(f"{k} = ?" for k in kwargs)
+    vals = list(kwargs.values()) + [battle_id]
+    c.execute(f"UPDATE battles SET {cols} WHERE battle_id = ?", vals)
+    conn.commit()
+    conn.close()
+
 # Active battle timers
 battle_timers = {}
 
@@ -274,6 +448,48 @@ ROB_SUCCESS_RATE = 0.35
 BEGINNER_PROTECTION_LEVEL = 5
 MAX_TEAM_SIZE = 5
 LOBBY_DURATION = 120  # 2 minutes
+DRAFT_TIMEOUT = 180   # 3 minutes to draft
+ROUND_TIMEOUT = 120   # 2 minutes per round
+
+# ══════════════════════════════════════════════════════════
+#  PHASE 4 — CARD DATA & ABILITIES
+# ══════════════════════════════════════════════════════════
+
+# Each power level (1-10) maps to a unit name and an ability key.
+CARD_DATA = {
+    1:  {"name": "Footman",      "ability": None},
+    2:  {"name": "Archer",       "ability": "first_strike"},
+    3:  {"name": "Spearman",     "ability": None},
+    4:  {"name": "Swordsman",    "ability": "counter_attack"},
+    5:  {"name": "Knight",       "ability": "healing_light"},
+    6:  {"name": "Shield Guard", "ability": "shield_wall"},
+    7:  {"name": "Giant",        "ability": "berserker_rage"},
+    8:  {"name": "Battle Mage",  "ability": "arcane_blast"},
+    9:  {"name": "Elite Guard",  "ability": "stealth"},
+    10: {"name": "Grand General","ability": "command"},
+}
+
+ABILITY_INFO = {
+    "command":        {"emoji": "👑", "name": "Command", "desc": "+1 team power"},
+    "first_strike":   {"emoji": "⚡", "name": "First Strike", "desc": "+0.5 power, tiebreaker"},
+    "shield_wall":    {"emoji": "🛡️", "name": "Shield Wall", "desc": "-1.5 enemy power"},
+    "healing_light":  {"emoji": "✨", "name": "Healing Light", "desc": "+1 team power"},
+    "counter_attack": {"emoji": "🔄", "name": "Counter Attack", "desc": "+1 power next round if lost"},
+    "berserker_rage": {"emoji": "💢", "name": "Berserker Rage", "desc": "+2 power if lost last round"},
+    "arcane_blast":   {"emoji": "🔮", "name": "Arcane Blast", "desc": "Ignores Shield Wall"},
+    "stealth":        {"emoji": "🌑", "name": "Stealth", "desc": "Ignores enemy's lowest card"},
+}
+
+def card_label(kingdom, power):
+    """Returns a display label like '🔴 Giant (7) - Berserker Rage'"""
+    k = KINGDOMS.get(kingdom, {})
+    emoji = k.get("emoji", "⚔️")
+    info = CARD_DATA.get(power, {"name": "Unknown", "ability": None})
+    label = f"{emoji} {info['name']} ({power})"
+    if info["ability"]:
+        ab = ABILITY_INFO[info["ability"]]
+        label += f" — {ab['emoji']} {ab['name']}"
+    return label
 
 def kingdom_badge(kingdom):
     if not kingdom:
@@ -388,10 +604,14 @@ def cmd_help(message):
         "⚔️ Battle\n"
         "/battle crimson vs azure 5000\n"
         "/join crimson — Join battle\n"
-        "/cancel — Cancel battle\n\n"
-        "📋 Draft (Coming Phase 4)\n"
-        "/draft — Pick cards\n"
-        "/playcard — Play card"
+        "/cancel — Cancel battle\n"
+        "/battlestatus — Lobby status\n\n"
+        "📋 Draft (DM only)\n"
+        "/draft 1 2 3 4 — Pick 4 cards\n"
+        "/redraft — Re-pick before confirm\n"
+        "/confirm — Lock in draft\n"
+        "/mycards — View your cards\n"
+        "/playcard 1-4 — Play a card"
     )
 
 @bot.message_handler(commands=["adminstats"])
@@ -748,10 +968,69 @@ def battle_lobby_timeout(battle_id, chat_id):
         f"{k1.get('emoji','🔴')} Team ({len(team1_players)})\n{t1_names}\n\n"
         f"{k2.get('emoji','🔵')} Team ({len(team2_players)})\n{t2_names}"
         f"{refund_text}\n\n"
-        f"🎴 Cards being sent to DM...\n"
-        f"Check your DM! (Phase 4)"
+        f"🎴 Cards sent to DM!\n"
+        f"📋 Each player: pick 4 of 6 cards with /draft\n"
+        f"⏰ Draft ends in 3 minutes"
     )
     bot.send_message(chat_id, msg)
+
+    # Deal cards to all players and send via DM
+    all_players = team1_players + team2_players
+    for p in all_players:
+        kingdom = p["kingdom"]
+        cards = deal_cards(battle_id, p["user_id"])
+        send_draft_cards_dm(p["user_id"], kingdom, cards)
+
+    # Start draft timeout timer
+    timer = threading.Timer(DRAFT_TIMEOUT, draft_timeout, args=[battle_id, chat_id])
+    timer.start()
+    battle_timers[f"draft_{battle_id}"] = timer
+
+
+def send_draft_cards_dm(user_id, kingdom, cards):
+    """Send dealt cards to player's DM with draft instructions."""
+    text = "🎴 Your Battle Cards!\n\n"
+    for i, power in enumerate(cards, start=1):
+        text += f"{i}. {card_label(kingdom, power)}\n"
+    text += (
+        "\n━━━━━━━━━━━━━━\n"
+        "Pick 4 cards by their numbers:\n"
+        "/draft 1 3 4 6\n\n"
+        "Then lock it in:\n"
+        "/confirm\n\n"
+        "Change your mind before confirming:\n"
+        "/redraft"
+    )
+    try:
+        bot.send_message(user_id, text)
+    except Exception as e:
+        print(f"DM Error to {user_id}: {e}")
+
+
+def draft_timeout(battle_id, chat_id):
+    """If draft phase times out, auto-draft for players who didn't confirm."""
+    battle = get_battle(battle_id)
+    if not battle or battle["status"] != "drafting":
+        return
+
+    players = get_battle_players(battle_id)
+    for p in players:
+        d = get_draft(battle_id, p["user_id"])
+        if not d or not d["confirmed"]:
+            # Auto-pick first 4 dealt cards
+            dealt = d["dealt_cards"] if d else random.sample(range(1, 11), 6)
+            auto_cards = dealt[:4]
+            set_drafted_cards(battle_id, p["user_id"], auto_cards)
+            confirm_draft(battle_id, p["user_id"])
+            try:
+                bot.send_message(p["user_id"],
+                    f"⏰ Time's up! Auto-drafted: {', '.join(map(str, auto_cards))}"
+                )
+            except:
+                pass
+
+    bot.send_message(chat_id, "⏰ Draft phase ended! Starting Round 1...")
+    start_round(battle_id, 1, chat_id)
 
 
 @bot.message_handler(commands=["battle"])
@@ -1008,6 +1287,495 @@ def cmd_battlestatus(message):
         f"💰 Wager: {battle['wager']:,} Gold\n"
         f"Use /join {battle['team1_kingdom']} or /join {battle['team2_kingdom']}"
     )
+
+# ══════════════════════════════════════════════════════════
+#  PHASE 4 — DRAFT, ROUNDS, BATTLE RESOLUTION
+# ══════════════════════════════════════════════════════════
+
+# ── /draft (DM) ─────────────────────────────────────────────
+@bot.message_handler(commands=["draft"])
+def cmd_draft(message):
+    user = message.from_user
+    battle = get_active_battle_for_user(user.id)
+    if not battle or battle["status"] != "drafting":
+        bot.reply_to(message, "❌ No active draft for you right now.")
+        return
+
+    draft = get_draft(battle["battle_id"], user.id)
+    if not draft:
+        bot.reply_to(message, "❌ Cards not dealt yet! Wait for the lobby to close.")
+        return
+
+    if draft["confirmed"]:
+        bot.reply_to(message, "🔒 Already confirmed!\nUse /redraft to re-pick before round 1 starts.")
+        return
+
+    parts = message.text.split()[1:]
+    if len(parts) != 4:
+        bot.reply_to(message, "❌ Pick exactly 4 cards!\nExample: /draft 1 2 3 4")
+        return
+
+    try:
+        positions = [int(p) for p in parts]
+    except ValueError:
+        bot.reply_to(message, "❌ Use numbers only!\nExample: /draft 1 2 3 4")
+        return
+
+    if len(set(positions)) != 4 or any(p < 1 or p > 6 for p in positions):
+        bot.reply_to(message, "❌ Pick 4 DIFFERENT numbers between 1-6!")
+        return
+
+    drafted_powers = [draft["dealt_cards"][p - 1] for p in positions]
+    set_drafted_cards(battle["battle_id"], user.id, drafted_powers)
+
+    db_user = get_user(user.id)
+    kingdom = db_user["kingdom"]
+    text = "✅ Draft Selected!\n\n"
+    for power in drafted_powers:
+        text += f"{card_label(kingdom, power)}\n"
+    text += "\n🔒 Lock it in: /confirm\n🔄 Change picks: /redraft"
+    bot.reply_to(message, text)
+
+
+# ── /redraft (DM) ───────────────────────────────────────────
+@bot.message_handler(commands=["redraft"])
+def cmd_redraft(message):
+    user = message.from_user
+    battle = get_active_battle_for_user(user.id)
+    if not battle or battle["status"] != "drafting":
+        bot.reply_to(message, "❌ No active draft for you right now.")
+        return
+
+    draft = get_draft(battle["battle_id"], user.id)
+    if not draft:
+        bot.reply_to(message, "❌ Cards not dealt yet!")
+        return
+
+    if draft["confirmed"]:
+        bot.reply_to(message, "🔒 Already confirmed! Cannot redraft now.")
+        return
+
+    db_user = get_user(user.id)
+    send_draft_cards_dm(user.id, db_user["kingdom"], draft["dealt_cards"])
+    bot.reply_to(message, "🔄 Pick again with /draft 1 2 3 4")
+
+
+# ── /confirm (DM) ───────────────────────────────────────────
+@bot.message_handler(commands=["confirm"])
+def cmd_confirm(message):
+    user = message.from_user
+    battle = get_active_battle_for_user(user.id)
+    if not battle or battle["status"] != "drafting":
+        bot.reply_to(message, "❌ Nothing to confirm right now.")
+        return
+
+    draft = get_draft(battle["battle_id"], user.id)
+    if not draft or len(draft["drafted_cards"]) != 4:
+        bot.reply_to(message, "❌ Pick 4 cards first!\n/draft 1 2 3 4")
+        return
+
+    if draft["confirmed"]:
+        bot.reply_to(message, "✅ Already confirmed!\nWaiting for other players...")
+        return
+
+    confirm_draft(battle["battle_id"], user.id)
+    bot.reply_to(message, "🔒 Draft confirmed!\nWaiting for other players...")
+
+    if all_players_confirmed(battle["battle_id"]):
+        key = f"draft_{battle['battle_id']}"
+        if key in battle_timers:
+            battle_timers[key].cancel()
+            del battle_timers[key]
+        bot.send_message(battle["chat_id"], "✅ All players drafted!\n⚔️ Round 1 begins now!")
+        start_round(battle["battle_id"], 1, battle["chat_id"])
+
+
+# ── /mycards (DM) ───────────────────────────────────────────
+@bot.message_handler(commands=["mycards"])
+def cmd_mycards(message):
+    user = message.from_user
+    battle = get_active_battle_for_user(user.id)
+    if not battle:
+        bot.reply_to(message, "❌ You're not in an active battle.")
+        return
+
+    draft = get_draft(battle["battle_id"], user.id)
+    db_user = get_user(user.id)
+    kingdom = db_user["kingdom"]
+
+    if not draft:
+        bot.reply_to(message, "❌ Cards not dealt yet!")
+        return
+
+    if battle["status"] == "drafting":
+        text = "🎴 Your Dealt Cards\n\n"
+        for i, power in enumerate(draft["dealt_cards"], 1):
+            text += f"{i}. {card_label(kingdom, power)}\n"
+        if draft["drafted_cards"]:
+            text += "\n✅ Drafted:\n"
+            for power in draft["drafted_cards"]:
+                text += f"  {card_label(kingdom, power)}\n"
+            text += "🔒 Confirmed!" if draft["confirmed"] else "\nUse /confirm to lock in"
+        else:
+            text += "\nPick 4: /draft 1 2 3 4"
+    else:
+        played = get_played_powers(battle["battle_id"], user.id)
+        text = f"🎴 Your Cards — Round {battle['current_round']}/4\n\n"
+        for i, power in enumerate(draft["drafted_cards"], 1):
+            status = " ✅ played" if power in played else ""
+            text += f"{i}. {card_label(kingdom, power)}{status}\n"
+    bot.reply_to(message, text)
+
+
+# ── /playcard (DM) ──────────────────────────────────────────
+@bot.message_handler(commands=["playcard"])
+def cmd_playcard(message):
+    user = message.from_user
+    battle = get_active_battle_for_user(user.id)
+    if not battle or battle["status"] != "battle":
+        bot.reply_to(message, "❌ No active round for you right now.")
+        return
+
+    parts = message.text.split()[1:]
+    if len(parts) != 1 or parts[0] not in ["1", "2", "3", "4"]:
+        bot.reply_to(message, "❌ Use /playcard 1, 2, 3, or 4")
+        return
+
+    pos = int(parts[0])
+    round_number = battle["current_round"]
+
+    if get_round_play(battle["battle_id"], round_number, user.id) is not None:
+        bot.reply_to(message, "✅ You already played this round!\nWait for results...")
+        return
+
+    draft = get_draft(battle["battle_id"], user.id)
+    power = draft["drafted_cards"][pos - 1]
+
+    played = get_played_powers(battle["battle_id"], user.id)
+    if power in played:
+        bot.reply_to(message, "❌ You already used this card in a previous round!")
+        return
+
+    play_card(battle["battle_id"], round_number, user.id, power)
+    db_user = get_user(user.id)
+    bot.reply_to(message,
+        f"✅ Played: {card_label(db_user['kingdom'], power)}\n"
+        f"⏳ Waiting for other players..."
+    )
+
+    if all_players_played_round(battle["battle_id"], round_number):
+        key = f"round_{battle['battle_id']}_{round_number}"
+        if key in battle_timers:
+            battle_timers[key].cancel()
+            del battle_timers[key]
+        resolve_round(battle["battle_id"], round_number, battle["chat_id"])
+
+
+# ── Round Management ────────────────────────────────────────
+
+def send_round_prompt_dm(battle_id, user_id, kingdom, round_number):
+    draft = get_draft(battle_id, user_id)
+    played = get_played_powers(battle_id, user_id)
+    text = f"⚔️ Round {round_number}/4 — Your Turn!\n\n"
+    for i, power in enumerate(draft["drafted_cards"], start=1):
+        status = " ✅ (played)" if power in played else ""
+        text += f"{i}. {card_label(kingdom, power)}{status}\n"
+    text += "\nPlay a card:\n/playcard 1\n/playcard 2\n/playcard 3\n/playcard 4"
+    try:
+        bot.send_message(user_id, text)
+    except Exception as e:
+        print(f"DM error to {user_id}: {e}")
+
+
+def start_round(battle_id, round_number, chat_id):
+    battle = get_battle(battle_id)
+    if not battle or battle["status"] == "finished":
+        return
+
+    if round_number == 1:
+        update_battle_status(battle_id, "battle")
+
+    update_battle_round_state(battle_id, current_round=round_number)
+    players = get_battle_players(battle_id)
+
+    bot.send_message(chat_id,
+        f"⚔️ Round {round_number}/4 has begun!\n"
+        f"📩 Check your DM and play a card!\n"
+        f"⏰ {ROUND_TIMEOUT // 60} minutes to play"
+    )
+
+    for p in players:
+        send_round_prompt_dm(battle_id, p["user_id"], p["kingdom"], round_number)
+
+    timer = threading.Timer(ROUND_TIMEOUT, round_timeout, args=[battle_id, round_number, chat_id])
+    timer.start()
+    battle_timers[f"round_{battle_id}_{round_number}"] = timer
+
+
+def round_timeout(battle_id, round_number, chat_id):
+    battle = get_battle(battle_id)
+    if not battle or battle["current_round"] != round_number or battle["status"] == "finished":
+        return
+
+    players = get_battle_players(battle_id)
+    for p in players:
+        if get_round_play(battle_id, round_number, p["user_id"]) is None:
+            draft = get_draft(battle_id, p["user_id"])
+            played = get_played_powers(battle_id, p["user_id"])
+            available = [c for c in draft["drafted_cards"] if c not in played]
+            if available:
+                auto_power = available[0]
+                play_card(battle_id, round_number, p["user_id"], auto_power)
+                try:
+                    bot.send_message(p["user_id"],
+                        f"⏰ Time's up! Auto-played: {card_label(p['kingdom'], auto_power)}")
+                except:
+                    pass
+
+    resolve_round(battle_id, round_number, chat_id)
+
+
+def calc_team_power(own_cards, enemy_cards, battle, team_num):
+    """
+    own_cards / enemy_cards: list of (user_id, kingdom, power)
+    Returns (final_power: float, log: list of strings)
+    """
+    own_powers = [c[2] for c in own_cards]
+    enemy_powers = [c[2] for c in enemy_cards]
+
+    own_abilities = set(CARD_DATA[p]["ability"] for p in own_powers if CARD_DATA[p]["ability"])
+    enemy_abilities = set(CARD_DATA[p]["ability"] for p in enemy_powers if CARD_DATA[p]["ability"])
+
+    base = float(sum(own_powers))
+    log = []
+
+    # Stealth — enemy ignores our lowest card
+    if "stealth" in enemy_abilities and own_powers:
+        lowest = min(own_powers)
+        base -= lowest
+        log.append(f"🌑 Enemy Stealth ignores -{lowest}")
+
+    # Command — +1 team power
+    if "command" in own_abilities:
+        base += 1
+        log.append("👑 Command +1")
+
+    # Healing Light — +1 team power
+    if "healing_light" in own_abilities:
+        base += 1
+        log.append("✨ Healing Light +1")
+
+    # First Strike — +0.5
+    if "first_strike" in own_abilities:
+        base += 0.5
+        log.append("⚡ First Strike +0.5")
+
+    # Berserker Rage — +2 if lost last round
+    last_result_key = "team1_last_result" if team_num == 1 else "team2_last_result"
+    if "berserker_rage" in own_abilities and battle.get(last_result_key) == "loss":
+        base += 2
+        log.append("💢 Berserker Rage +2")
+
+    # Counter Attack — carried bonus from previous round
+    bonus_key = "team1_bonus" if team_num == 1 else "team2_bonus"
+    carry_bonus = battle.get(bonus_key, 0) or 0
+    if carry_bonus:
+        base += carry_bonus
+        log.append(f"🔄 Counter Attack +{carry_bonus}")
+
+    # Shield Wall — enemy reduces our power, unless we have Arcane Blast
+    if "shield_wall" in enemy_abilities and "arcane_blast" not in own_abilities:
+        base -= 1.5
+        log.append("🛡️ Enemy Shield Wall -1.5")
+    elif "shield_wall" in enemy_abilities and "arcane_blast" in own_abilities:
+        log.append("🔮 Arcane Blast negates Shield Wall")
+
+    return base, log
+
+
+def resolve_round(battle_id, round_number, chat_id):
+    battle = get_battle(battle_id)
+    team1 = get_team_players(battle_id, 1)
+    team2 = get_team_players(battle_id, 2)
+
+    def build_cards(team):
+        cards = []
+        for p in team:
+            power = get_round_play(battle_id, round_number, p["user_id"])
+            if power is None:
+                power = 1
+            cards.append({"user_id": p["user_id"], "kingdom": p["kingdom"],
+                           "power": power, "name": p["display_name"]})
+        return cards
+
+    t1_cards = build_cards(team1)
+    t2_cards = build_cards(team2)
+
+    t1_tuples = [(c["user_id"], c["kingdom"], c["power"]) for c in t1_cards]
+    t2_tuples = [(c["user_id"], c["kingdom"], c["power"]) for c in t2_cards]
+
+    t1_power, t1_log = calc_team_power(t1_tuples, t2_tuples, battle, 1)
+    t2_power, t2_log = calc_team_power(t2_tuples, t1_tuples, battle, 2)
+
+    if t1_power > t2_power:
+        winner = 1
+    elif t2_power > t1_power:
+        winner = 2
+    else:
+        winner = random.choice([1, 2])
+
+    k1 = KINGDOMS[battle["team1_kingdom"]]
+    k2 = KINGDOMS[battle["team2_kingdom"]]
+
+    t1_lines = "\n".join([f"  {card_label(c['kingdom'], c['power'])} — {c['name']}" for c in t1_cards])
+    t2_lines = "\n".join([f"  {card_label(c['kingdom'], c['power'])} — {c['name']}" for c in t2_cards])
+
+    t1_bonus_text = "\n".join(f"  {l}" for l in t1_log) if t1_log else "  (none)"
+    t2_bonus_text = "\n".join(f"  {l}" for l in t2_log) if t2_log else "  (none)"
+
+    def fmt_power(p):
+        return str(int(p)) if p == int(p) else str(p)
+
+    winner_name = k1["name"] if winner == 1 else k2["name"]
+    winner_emoji = k1["emoji"] if winner == 1 else k2["emoji"]
+
+    msg = (
+        f"🎴 Round {round_number} — Cards Revealed!\n\n"
+        f"{k1['emoji']} {k1['name']}\n{t1_lines}\n"
+        f"Bonuses:\n{t1_bonus_text}\n"
+        f"⚡ Total Power: {fmt_power(t1_power)}\n\n"
+        f"{k2['emoji']} {k2['name']}\n{t2_lines}\n"
+        f"Bonuses:\n{t2_bonus_text}\n"
+        f"⚡ Total Power: {fmt_power(t2_power)}\n\n"
+        f"🏆 {winner_emoji} {winner_name} wins Round {round_number}!"
+    )
+    bot.send_message(chat_id, msg)
+
+    t1_wins = battle["team1_wins"] + (1 if winner == 1 else 0)
+    t2_wins = battle["team2_wins"] + (1 if winner == 2 else 0)
+    t1_total = (battle["team1_total_power"] or 0) + t1_power
+    t2_total = (battle["team2_total_power"] or 0) + t2_power
+
+    # Counter Attack — sets up bonus for next round if team loses
+    t1_has_counter = any(CARD_DATA[c["power"]]["ability"] == "counter_attack" for c in t1_cards)
+    t2_has_counter = any(CARD_DATA[c["power"]]["ability"] == "counter_attack" for c in t2_cards)
+    new_t1_bonus = 1 if (winner == 2 and t1_has_counter) else 0
+    new_t2_bonus = 1 if (winner == 1 and t2_has_counter) else 0
+
+    update_battle_round_state(
+        battle_id,
+        team1_wins=t1_wins, team2_wins=t2_wins,
+        team1_total_power=t1_total, team2_total_power=t2_total,
+        team1_last_result=("loss" if winner == 2 else "win"),
+        team2_last_result=("loss" if winner == 1 else "win"),
+        team1_bonus=new_t1_bonus, team2_bonus=new_t2_bonus,
+    )
+
+    if round_number < 4:
+        timer = threading.Timer(6, start_round, args=[battle_id, round_number + 1, chat_id])
+        timer.start()
+    else:
+        timer = threading.Timer(6, finish_battle, args=[battle_id, chat_id])
+        timer.start()
+
+
+def finish_battle(battle_id, chat_id):
+    battle = get_battle(battle_id)
+    team1 = get_team_players(battle_id, 1)
+    team2 = get_team_players(battle_id, 2)
+
+    t1_wins = battle["team1_wins"]
+    t2_wins = battle["team2_wins"]
+
+    if t1_wins > t2_wins:
+        winner_team = 1
+    elif t2_wins > t1_wins:
+        winner_team = 2
+    else:
+        t1_total = battle["team1_total_power"] or 0
+        t2_total = battle["team2_total_power"] or 0
+        if t1_total > t2_total:
+            winner_team = 1
+        elif t2_total > t1_total:
+            winner_team = 2
+        else:
+            winner_team = random.choice([1, 2])
+
+    winners = team1 if winner_team == 1 else team2
+    losers = team2 if winner_team == 1 else team1
+    winner_kingdom = battle["team1_kingdom"] if winner_team == 1 else battle["team2_kingdom"]
+    loser_kingdom = battle["team2_kingdom"] if winner_team == 1 else battle["team1_kingdom"]
+
+    wager = battle["wager"]
+    total_pool = wager * (len(team1) + len(team2))
+    share = total_pool // len(winners) if winners else 0
+
+    XP_WIN = 50
+    XP_LOSS = 20
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    for p in winners:
+        c.execute("""
+            UPDATE users SET gold = gold + ?, wins = wins + 1, battles = battles + 1,
+                xp = xp + ?, current_streak = current_streak + 1
+            WHERE user_id = ?
+        """, (share, XP_WIN, p["user_id"]))
+        c.execute("""
+            UPDATE users SET best_streak = current_streak
+            WHERE user_id = ? AND current_streak > best_streak
+        """, (p["user_id"],))
+        c.execute("INSERT INTO transactions (user_id, type, amount, description) VALUES (?, ?, ?, ?)",
+                  (p["user_id"], "credit", share, f"Battle #{battle_id} win"))
+    for p in losers:
+        c.execute("""
+            UPDATE users SET losses = losses + 1, battles = battles + 1,
+                xp = xp + ?, current_streak = 0
+            WHERE user_id = ?
+        """, (XP_LOSS, p["user_id"]))
+
+    # Simple level-up: level = xp // 200 + 1
+    for p in winners + losers:
+        c.execute("SELECT xp FROM users WHERE user_id = ?", (p["user_id"],))
+        xp_row = c.fetchone()
+        if xp_row:
+            new_level = xp_row[0] // 200 + 1
+            c.execute("UPDATE users SET level = ? WHERE user_id = ?", (new_level, p["user_id"]))
+
+    c.execute("UPDATE kingdom_stats SET total_wins = total_wins + 1 WHERE kingdom = ?", (winner_kingdom,))
+    c.execute("UPDATE kingdom_stats SET total_losses = total_losses + 1 WHERE kingdom = ?", (loser_kingdom,))
+
+    conn.commit()
+    conn.close()
+
+    update_battle_status(battle_id, "finished")
+    update_battle_round_state(battle_id, winner_kingdom=winner_kingdom)
+
+    k1 = KINGDOMS[battle["team1_kingdom"]]
+    k2 = KINGDOMS[battle["team2_kingdom"]]
+    wk = KINGDOMS[winner_kingdom]
+
+    winner_names = ", ".join([p["display_name"] for p in winners]) or "(no one)"
+
+    msg = (
+        f"🏆 BATTLE FINISHED!\n\n"
+        f"{k1['emoji']} {k1['name']}  {t1_wins} - {t2_wins}  {k2['emoji']} {k2['name']}\n\n"
+        f"👑 Winner: {wk['emoji']} {wk['name']}!\n"
+        f"🎉 {winner_names}\n\n"
+        f"💰 Each winner: +{share:,} Gold\n"
+        f"✨ Winners +{XP_WIN} XP | Losers +{XP_LOSS} XP"
+    )
+    bot.send_message(chat_id, msg)
+
+    # Cleanup any leftover timers for this battle
+    for key in list(battle_timers.keys()):
+        if f"_{battle_id}_" in key or key.endswith(f"_{battle_id}"):
+            try:
+                battle_timers[key].cancel()
+            except:
+                pass
+            del battle_timers[key]
+
 
 # ══════════════════════════════════════════════════════════
 #  AKARI AI CHATBOT
