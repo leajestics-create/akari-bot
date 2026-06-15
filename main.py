@@ -423,6 +423,73 @@ def update_battle_round_state(battle_id, **kwargs):
 # Active battle timers
 battle_timers = {}
 
+# ── Phase 5: Periodic warnings (every 30 seconds) ──────────
+
+def get_pending_draft_players(battle_id):
+    players = get_battle_players(battle_id)
+    pending = []
+    for p in players:
+        d = get_draft(battle_id, p["user_id"])
+        if not d or not d["confirmed"]:
+            pending.append(p["display_name"])
+    return pending
+
+def get_pending_round_players(battle_id, round_number):
+    players = get_battle_players(battle_id)
+    pending = []
+    for p in players:
+        if get_round_play(battle_id, round_number, p["user_id"]) is None:
+            pending.append(p["display_name"])
+    return pending
+
+def send_warning(battle_id, chat_id, remaining, phase, round_number=None):
+    battle = get_battle(battle_id)
+    if not battle:
+        return
+
+    if phase == "lobby" and battle["status"] != "waiting":
+        return
+    if phase == "draft" and battle["status"] != "drafting":
+        return
+    if phase == "round" and (battle["status"] != "battle" or battle["current_round"] != round_number):
+        return
+
+    if phase == "lobby":
+        t1 = get_team_players(battle_id, 1)
+        t2 = get_team_players(battle_id, 2)
+        k1 = KINGDOMS[battle["team1_kingdom"]]
+        k2 = KINGDOMS[battle["team2_kingdom"]]
+        bot.send_message(chat_id,
+            f"⏰ {remaining}s left to join!\n"
+            f"{k1['emoji']} {len(t1)}/{MAX_TEAM_SIZE}  vs  "
+            f"{k2['emoji']} {len(t2)}/{MAX_TEAM_SIZE}"
+        )
+    elif phase == "draft":
+        pending = get_pending_draft_players(battle_id)
+        if pending:
+            bot.send_message(chat_id,
+                f"⏰ {remaining}s left to draft!\n"
+                f"📋 Waiting on: {', '.join(pending)}"
+            )
+    elif phase == "round":
+        pending = get_pending_round_players(battle_id, round_number)
+        if pending:
+            bot.send_message(chat_id,
+                f"⏰ {remaining}s left — Round {round_number}!\n"
+                f"📋 Waiting on: {', '.join(pending)}"
+            )
+
+def schedule_warnings(battle_id, chat_id, total_seconds, phase, round_number=None):
+    """Schedule a warning every 30 seconds until the timer runs out."""
+    t = 30
+    while t < total_seconds:
+        remaining = total_seconds - t
+        timer = threading.Timer(t, send_warning, args=[battle_id, chat_id, remaining, phase, round_number])
+        timer.start()
+        key = f"warn_{phase}_{battle_id}_{round_number}_{t}"
+        battle_timers[key] = timer
+        t += 30
+
 # ══════════════════════════════════════════════════════════
 #  KINGDOMS DATA
 # ══════════════════════════════════════════════════════════
@@ -450,6 +517,7 @@ MAX_TEAM_SIZE = 5
 LOBBY_DURATION = 120  # 2 minutes
 DRAFT_TIMEOUT = 180   # 3 minutes to draft
 ROUND_TIMEOUT = 120   # 2 minutes per round
+TREASURY_TAX_RATE = 0.02  # 2% of battle pool goes to winning kingdom's treasury
 
 # ══════════════════════════════════════════════════════════
 #  PHASE 4 — CARD DATA & ABILITIES
@@ -542,7 +610,7 @@ def cmd_kingdom(message):
         bot.reply_to(message, f"🔒 Already pledged to {k}\nCannot change kingdom.")
         return
     smallest = get_smallest_kingdom()
-    text = "🏰 Choose Your Kingdom\n\n"
+    text = "🏰 Choose Your Kingdom\n\nTap a button below 👇\n\n"
     for key, data in KINGDOMS.items():
         extra = ""
         if key == "solar":
@@ -550,8 +618,52 @@ def cmd_kingdom(message):
         if key == smallest:
             extra += " 🎯+15% Daily"
         text += f"{data['emoji']} {data['name']}{extra}\n{data['desc']}\n\n"
-    text += "Reply: crimson / azure / emerald / shadow / solar"
-    bot.reply_to(message, text)
+
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    for key, data in KINGDOMS.items():
+        label = f"{data['emoji']} {data['name']}"
+        if key == smallest:
+            label += " 🎯"
+        markup.add(telebot.types.InlineKeyboardButton(label, callback_data=f"kingdom:{key}"))
+
+    bot.reply_to(message, text, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kingdom:"))
+def kingdom_callback(call):
+    user = call.from_user
+    display = get_display(user)
+    username = user.username or str(user.id)
+    db_user = get_or_create_user(user.id, username, display)
+
+    if db_user.get("kingdom_locked"):
+        k = kingdom_badge(db_user["kingdom"])
+        bot.answer_callback_query(call.id, f"Already pledged to {k}!", show_alert=True)
+        return
+
+    kingdom_key = call.data.split(":")[1]
+    if kingdom_key not in KINGDOMS:
+        bot.answer_callback_query(call.id, "Invalid kingdom!")
+        return
+
+    set_kingdom(user.id, kingdom_key)
+    k_data = KINGDOMS[kingdom_key]
+    smallest = get_smallest_kingdom()
+    bonus = ""
+    if kingdom_key == "solar":
+        bonus = "\n🌟 +10% Gold | +10% Drop Rate"
+    if kingdom_key == smallest:
+        bonus += "\n🎯 +15% Daily (Lowest Population)"
+
+    bot.answer_callback_query(call.id, f"Joined {k_data['name']}!")
+    bot.edit_message_text(
+        f"⚔️ Kingdom Pledged!\n\n"
+        f"You joined {k_data['emoji']} {k_data['name']}!\n"
+        f"{k_data['desc']}{bonus}\n\n"
+        f"Use /profile to see your stats!",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id
+    )
 
 @bot.message_handler(commands=["profile"])
 def cmd_profile(message):
@@ -600,7 +712,8 @@ def cmd_help(message):
         "/daily — Daily gold\n"
         "/rob @user — Rob player\n"
         "/protect 1h/24h/7d — Protection\n"
-        "/leaderboard — Rankings\n\n"
+        "/leaderboard — Rankings\n"
+        "/kingdomrank — Kingdom treasury\n\n"
         "⚔️ Battle\n"
         "/battle crimson vs azure 5000\n"
         "/join crimson — Join battle\n"
@@ -642,30 +755,6 @@ def cmd_adminstats(message):
         f"💰 Economy\n"
         f"Total: {int(gold_row[0] or 0):,}\n"
         f"Avg: {int(gold_row[1] or 0):,} | Max: {int(gold_row[2] or 0):,}"
-    )
-
-@bot.message_handler(func=lambda m: m.text and m.text.lower().strip() in KINGDOMS)
-def select_kingdom(message):
-    user = message.from_user
-    display = get_display(user)
-    username = user.username or str(user.id)
-    db_user = get_or_create_user(user.id, username, display)
-    if db_user.get("kingdom_locked"):
-        return
-    kingdom_key = message.text.lower().strip()
-    set_kingdom(user.id, kingdom_key)
-    k_data = KINGDOMS[kingdom_key]
-    smallest = get_smallest_kingdom()
-    bonus = ""
-    if kingdom_key == "solar":
-        bonus = "\n🌟 +10% Gold | +10% Drop Rate"
-    if kingdom_key == smallest:
-        bonus += "\n🎯 +15% Daily (Lowest Population)"
-    bot.reply_to(message,
-        f"⚔️ Kingdom Pledged!\n\n"
-        f"You joined {k_data['emoji']} {k_data['name']}!\n"
-        f"{k_data['desc']}{bonus}\n\n"
-        f"Use /profile to see your stats!"
     )
 
 # ══════════════════════════════════════════════════════════
@@ -891,6 +980,32 @@ def cmd_leaderboard(message):
         text += f"{i+1}. {emoji} {k['kingdom'].capitalize()}: {k['member_count']} members\n"
     bot.reply_to(message, text)
 
+
+@bot.message_handler(commands=["kingdomrank"])
+def cmd_kingdomrank(message):
+    """Phase 5 — Kingdom Treasury & War Power rankings."""
+    kingdom_data = get_kingdom_stats()
+
+    # Sort by treasury (war power)
+    ranked = sorted(kingdom_data, key=lambda k: k["treasury"], reverse=True)
+
+    text = "🏦 Kingdom Treasury Rankings\n\n"
+    medals = ["🥇", "🥈", "🥉"]
+    for i, k in enumerate(ranked):
+        emoji = KINGDOMS.get(k["kingdom"], {}).get("emoji", "⚔️")
+        name = KINGDOMS.get(k["kingdom"], {}).get("name", k["kingdom"].capitalize())
+        medal = medals[i] if i < 3 else f"{i+1}."
+        total_battles = k["total_wins"] + k["total_losses"]
+        win_rate = round((k["total_wins"] / total_battles) * 100) if total_battles > 0 else 0
+        text += (
+            f"{medal} {emoji} {name}\n"
+            f"   🏦 Treasury: {k['treasury']:,} Gold\n"
+            f"   ⚔️ {k['total_wins']}W - {k['total_losses']}L ({win_rate}%)\n"
+            f"   👥 {k['member_count']} members\n\n"
+        )
+    text += f"💡 Win battles to grow your kingdom's treasury!\n({int(TREASURY_TAX_RATE*100)}% of every battle pool)"
+    bot.reply_to(message, text)
+
 # ══════════════════════════════════════════════════════════
 #  PHASE 3 — BATTLE LOBBY
 # ══════════════════════════════════════════════════════════
@@ -985,21 +1100,31 @@ def battle_lobby_timeout(battle_id, chat_id):
     timer = threading.Timer(DRAFT_TIMEOUT, draft_timeout, args=[battle_id, chat_id])
     timer.start()
     battle_timers[f"draft_{battle_id}"] = timer
+    schedule_warnings(battle_id, chat_id, DRAFT_TIMEOUT, "draft")
 
 
 def send_draft_cards_dm(user_id, kingdom, cards):
     """Send dealt cards to player's DM with draft instructions."""
-    text = "🎴 Your Battle Cards!\n\n"
+    k = KINGDOMS.get(kingdom, {})
+    text = (
+        f"🎴 ━━━ YOUR CARDS ━━━ 🎴\n"
+        f"{k.get('emoji','⚔️')} {k.get('name','Unknown')} Kingdom\n\n"
+    )
     for i, power in enumerate(cards, start=1):
-        text += f"{i}. {card_label(kingdom, power)}\n"
+        info = CARD_DATA[power]
+        line = f"{i}️⃣  {info['name']}  ⚡{power}"
+        if info["ability"]:
+            ab = ABILITY_INFO[info["ability"]]
+            line += f"\n     {ab['emoji']} {ab['name']} — {ab['desc']}"
+        text += line + "\n\n"
     text += (
-        "\n━━━━━━━━━━━━━━\n"
-        "Pick 4 cards by their numbers:\n"
-        "/draft 1 3 4 6\n\n"
-        "Then lock it in:\n"
-        "/confirm\n\n"
-        "Change your mind before confirming:\n"
-        "/redraft"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "📋 Pick 4 of these 6 cards:\n"
+        "➜ /draft 1 3 4 6\n\n"
+        "🔒 Lock in your pick:\n"
+        "➜ /confirm\n\n"
+        "🔄 Change your mind:\n"
+        "➜ /redraft"
     )
     try:
         bot.send_message(user_id, text)
@@ -1137,6 +1262,7 @@ def cmd_battle(message):
     )
     timer.start()
     battle_timers[battle_id] = timer
+    schedule_warnings(battle_id, message.chat.id, LOBBY_DURATION, "lobby")
 
 
 @bot.message_handler(commands=["join"])
@@ -1476,15 +1602,35 @@ def cmd_playcard(message):
 def send_round_prompt_dm(battle_id, user_id, kingdom, round_number):
     draft = get_draft(battle_id, user_id)
     played = get_played_powers(battle_id, user_id)
-    text = f"⚔️ Round {round_number}/4 — Your Turn!\n\n"
+    k = KINGDOMS.get(kingdom, {})
+
+    text = (
+        f"⚔️ ━━━ ROUND {round_number}/4 ━━━ ⚔️\n"
+        f"{k.get('emoji','⚔️')} Your turn!\n\n"
+    )
+    available_nums = []
     for i, power in enumerate(draft["drafted_cards"], start=1):
-        status = " ✅ (played)" if power in played else ""
-        text += f"{i}. {card_label(kingdom, power)}{status}\n"
-    text += "\nPlay a card:\n/playcard 1\n/playcard 2\n/playcard 3\n/playcard 4"
+        info = CARD_DATA[power]
+        if power in played:
+            text += f"{i}️⃣  ~~{info['name']} (⚡{power})~~ ✅ used\n"
+        else:
+            line = f"{i}️⃣  {info['name']}  ⚡{power}"
+            if info["ability"]:
+                ab = ABILITY_INFO[info["ability"]]
+                line += f"\n     {ab['emoji']} {ab['name']}"
+            text += line + "\n"
+            available_nums.append(str(i))
+
+    text += "\n━━━━━━━━━━━━━━━━━━━\n"
+    if available_nums:
+        text += "🎯 Play a card:\n"
+        for n in available_nums:
+            text += f"➜ /playcard {n}\n"
     try:
         bot.send_message(user_id, text)
     except Exception as e:
         print(f"DM error to {user_id}: {e}")
+
 
 
 def start_round(battle_id, round_number, chat_id):
@@ -1510,6 +1656,7 @@ def start_round(battle_id, round_number, chat_id):
     timer = threading.Timer(ROUND_TIMEOUT, round_timeout, args=[battle_id, round_number, chat_id])
     timer.start()
     battle_timers[f"round_{battle_id}_{round_number}"] = timer
+    schedule_warnings(battle_id, chat_id, ROUND_TIMEOUT, "round", round_number)
 
 
 def round_timeout(battle_id, round_number, chat_id):
@@ -1627,11 +1774,19 @@ def resolve_round(battle_id, round_number, chat_id):
     k1 = KINGDOMS[battle["team1_kingdom"]]
     k2 = KINGDOMS[battle["team2_kingdom"]]
 
-    t1_lines = "\n".join([f"  {card_label(c['kingdom'], c['power'])} — {c['name']}" for c in t1_cards])
-    t2_lines = "\n".join([f"  {card_label(c['kingdom'], c['power'])} — {c['name']}" for c in t2_cards])
+    def card_line(c):
+        info = CARD_DATA[c["power"]]
+        line = f"  {info['name']} ⚡{c['power']} — {c['name']}"
+        if info["ability"]:
+            ab = ABILITY_INFO[info["ability"]]
+            line += f" {ab['emoji']}"
+        return line
 
-    t1_bonus_text = "\n".join(f"  {l}" for l in t1_log) if t1_log else "  (none)"
-    t2_bonus_text = "\n".join(f"  {l}" for l in t2_log) if t2_log else "  (none)"
+    t1_lines = "\n".join(card_line(c) for c in t1_cards)
+    t2_lines = "\n".join(card_line(c) for c in t2_cards)
+
+    t1_bonus_text = "\n".join(f"  {l}" for l in t1_log) if t1_log else "  — none —"
+    t2_bonus_text = "\n".join(f"  {l}" for l in t2_log) if t2_log else "  — none —"
 
     def fmt_power(p):
         return str(int(p)) if p == int(p) else str(p)
@@ -1640,14 +1795,19 @@ def resolve_round(battle_id, round_number, chat_id):
     winner_emoji = k1["emoji"] if winner == 1 else k2["emoji"]
 
     msg = (
-        f"🎴 Round {round_number} — Cards Revealed!\n\n"
-        f"{k1['emoji']} {k1['name']}\n{t1_lines}\n"
-        f"Bonuses:\n{t1_bonus_text}\n"
-        f"⚡ Total Power: {fmt_power(t1_power)}\n\n"
-        f"{k2['emoji']} {k2['name']}\n{t2_lines}\n"
-        f"Bonuses:\n{t2_bonus_text}\n"
-        f"⚡ Total Power: {fmt_power(t2_power)}\n\n"
-        f"🏆 {winner_emoji} {winner_name} wins Round {round_number}!"
+        f"🎴 ═══ ROUND {round_number} REVEAL ═══ 🎴\n\n"
+        f"{k1['emoji']} {k1['name']}\n"
+        f"{t1_lines}\n"
+        f"✨ Bonuses:\n{t1_bonus_text}\n"
+        f"⚡ TOTAL: {fmt_power(t1_power)}\n"
+        f"━━━━━━━ ⚔️ VS ⚔️ ━━━━━━━\n"
+        f"{k2['emoji']} {k2['name']}\n"
+        f"{t2_lines}\n"
+        f"✨ Bonuses:\n{t2_bonus_text}\n"
+        f"⚡ TOTAL: {fmt_power(t2_power)}\n\n"
+        f"🏆🏆🏆 {winner_emoji} {winner_name.upper()} WINS ROUND {round_number}! 🏆🏆🏆\n"
+        f"📊 Score: {k1['emoji']}{battle['team1_wins'] + (1 if winner==1 else 0)} - "
+        f"{k2['emoji']}{battle['team2_wins'] + (1 if winner==2 else 0)}"
     )
     bot.send_message(chat_id, msg)
 
@@ -1708,13 +1868,19 @@ def finish_battle(battle_id, chat_id):
 
     wager = battle["wager"]
     total_pool = wager * (len(team1) + len(team2))
-    share = total_pool // len(winners) if winners else 0
+
+    # Phase 5: Kingdom Treasury Tax — 2% of the pool goes to the winning kingdom's treasury
+    treasury_cut = int(total_pool * TREASURY_TAX_RATE)
+    remaining_pool = total_pool - treasury_cut
+    share = remaining_pool // len(winners) if winners else 0
 
     XP_WIN = 50
     XP_LOSS = 20
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    c.execute("UPDATE kingdom_stats SET treasury = treasury + ? WHERE kingdom = ?",
+              (treasury_cut, winner_kingdom))
     for p in winners:
         c.execute("""
             UPDATE users SET gold = gold + ?, wins = wins + 1, battles = battles + 1,
@@ -1763,6 +1929,7 @@ def finish_battle(battle_id, chat_id):
         f"👑 Winner: {wk['emoji']} {wk['name']}!\n"
         f"🎉 {winner_names}\n\n"
         f"💰 Each winner: +{share:,} Gold\n"
+        f"🏦 {wk['emoji']} Treasury: +{treasury_cut:,} Gold\n"
         f"✨ Winners +{XP_WIN} XP | Losers +{XP_LOSS} XP"
     )
     bot.send_message(chat_id, msg)
